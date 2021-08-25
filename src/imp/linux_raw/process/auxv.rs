@@ -6,11 +6,11 @@
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
 
-use linux_raw_sys::general::{AT_HWCAP, AT_NULL, AT_PAGESZ};
-use linux_raw_sys::v5_4::general::{AT_HWCAP2, AT_SYSINFO_EHDR};
-use std::os::raw::c_char;
+use crate::c_types::c_char;
 #[cfg(target_env = "gnu")]
-use std::os::raw::c_int;
+use crate::c_types::c_int;
+use linux_raw_sys::general::{AT_HWCAP, AT_NULL, AT_PAGESZ, AT_SYSINFO_EHDR};
+use linux_raw_sys::v5_4::general::AT_HWCAP2;
 
 #[inline]
 pub(crate) fn page_size() -> usize {

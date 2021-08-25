@@ -2,9 +2,9 @@
 
 use crate::imp;
 use crate::io::{self, OwnedFd};
-use io_lifetimes::AsFd;
 #[cfg(not(any(target_os = "wasi", target_os = "fuchsia")))]
-use std::ffi::OsString;
+use crate::std_ffi::OsString;
+use io_lifetimes::AsFd;
 
 #[cfg(not(target_os = "wasi"))]
 pub use imp::io::DupFlags;
@@ -134,7 +134,7 @@ pub fn dup2_with<Fd: AsFd>(fd: &Fd, new: &OwnedFd, flags: DupFlags) -> io::Resul
 #[cfg(not(any(target_os = "fuchsia", target_os = "wasi")))]
 #[inline]
 pub fn ttyname<Fd: AsFd>(dirfd: &Fd, reuse: OsString) -> io::Result<OsString> {
-    use std::os::unix::ffi::OsStringExt;
+    use crate::std_os_ffi::OsStringExt;
 
     // This code would benefit from having a better way to read into
     // uninitialized memory, but that requires `unsafe`.

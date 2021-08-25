@@ -7,7 +7,7 @@
 #![allow(unsafe_code)]
 
 use crate::{imp, io};
-use std::ffi::CStr;
+use crate::std_ffi::CStr;
 
 #[cfg(target_arch = "x86")]
 #[inline]
@@ -17,13 +17,13 @@ pub unsafe fn set_thread_area(u_info: &mut UserDesc) -> io::Result<()> {
 
 #[cfg(target_arch = "arm")]
 #[inline]
-pub unsafe fn arm_set_tls(data: *mut std::ffi::c_void) -> io::Result<()> {
+pub unsafe fn arm_set_tls(data: *mut crate::c_types::c_void) -> io::Result<()> {
     imp::syscalls::tls::arm_set_tls(data)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub unsafe fn set_fs(data: *mut std::ffi::c_void) {
+pub unsafe fn set_fs(data: *mut crate::c_types::c_void) {
     imp::syscalls::tls::set_fs(data)
 }
 

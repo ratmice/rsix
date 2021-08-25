@@ -35,9 +35,11 @@ use super::fs::{
     Access, Advice as FsAdvice, AtFlags, FallocateFlags, FdFlags, FlockOperation, MemfdFlags, Mode,
     OFlags, RenameFlags, ResolveFlags, Stat, StatFs, StatxFlags,
 };
+#[cfg(feature = "vectored")]
+use super::io::ReadWriteFlags;
 use super::io::{
     epoll, Advice as IoAdvice, DupFlags, EventfdFlags, MapFlags, MlockFlags, MprotectFlags,
-    PipeFlags, PollFd, ProtFlags, ReadWriteFlags, UserfaultfdFlags,
+    PipeFlags, PollFd, ProtFlags, UserfaultfdFlags,
 };
 #[cfg(not(target_os = "wasi"))]
 use super::io::{Termios, Winsize};
@@ -52,11 +54,17 @@ use super::reg::nr;
 #[cfg(target_arch = "x86")]
 use super::reg::{ArgReg, SocketArg};
 use super::time::{ClockId, Timespec};
+use crate::c_types::{c_int, c_uint, c_void};
 use crate::io;
 use crate::io::{OwnedFd, RawFd};
 use crate::path::DecInt;
 use crate::process::{Cpuid, Gid, MembarrierCommand, MembarrierQuery, Pid, Uid};
+use crate::std_ffi::CStr;
+use crate::std_io::SeekFrom;
+use crate::std_net::{SocketAddrV4, SocketAddrV6};
 use crate::time::NanosleepRelativeResult;
+use core::convert::TryInto;
+use core::mem::MaybeUninit;
 use io_lifetimes::{AsFd, BorrowedFd};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use linux_raw_sys::general::__NR_epoll_pwait;
@@ -84,10 +92,10 @@ use linux_raw_sys::general::{
     __NR_fchdir, __NR_fchmod, __NR_fchmodat, __NR_fdatasync, __NR_flock, __NR_fsync, __NR_getcwd,
     __NR_getdents64, __NR_getpid, __NR_getppid, __NR_getpriority, __NR_gettid, __NR_ioctl,
     __NR_linkat, __NR_madvise, __NR_mkdirat, __NR_mknodat, __NR_mlock, __NR_mprotect, __NR_munlock,
-    __NR_munmap, __NR_nanosleep, __NR_openat, __NR_pipe2, __NR_prctl, __NR_pread64, __NR_preadv,
-    __NR_pwrite64, __NR_pwritev, __NR_read, __NR_readlinkat, __NR_readv, __NR_sched_yield,
+    __NR_munmap, __NR_nanosleep, __NR_openat, __NR_pipe2, __NR_prctl, __NR_pread64,
+    __NR_pwrite64, __NR_read, __NR_readlinkat, __NR_sched_yield,
     __NR_setpriority, __NR_symlinkat, __NR_uname, __NR_unlinkat, __NR_utimensat, __NR_write,
-    __NR_writev, __kernel_gid_t, __kernel_pid_t, __kernel_timespec, __kernel_uid_t, epoll_event,
+    __kernel_gid_t, __kernel_pid_t, __kernel_timespec, __kernel_uid_t, epoll_event,
     sockaddr, sockaddr_in, sockaddr_in6, sockaddr_un, socklen_t, AT_FDCWD, AT_REMOVEDIR,
     AT_SYMLINK_NOFOLLOW, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, FIONBIO, FIONREAD, F_DUPFD,
     F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLEASE, F_GETOWN, F_GETSIG, F_SETFD, F_SETFL,
@@ -101,6 +109,8 @@ use linux_raw_sys::general::{__NR_getegid, __NR_geteuid, __NR_getgid, __NR_getui
 use linux_raw_sys::general::{__NR_getegid32, __NR_geteuid32, __NR_getgid32, __NR_getuid32};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use linux_raw_sys::general::{__NR_ppoll, sigset_t};
+#[cfg(feature = "vectored")]
+use linux_raw_sys::general::{__NR_preadv, __NR_pwritev, __NR_readv, __NR_writev};
 #[cfg(not(any(
     target_arch = "x86",
     target_arch = "x86_64",
@@ -111,15 +121,13 @@ use linux_raw_sys::general::{__NR_recv, __NR_send};
 use linux_raw_sys::v5_11::general::{__NR_openat2, open_how};
 use linux_raw_sys::v5_4::general::{
     __NR_copy_file_range, __NR_eventfd2, __NR_getrandom, __NR_membarrier, __NR_memfd_create,
-    __NR_mlock2, __NR_preadv2, __NR_pwritev2, __NR_renameat2, __NR_statx, __NR_userfaultfd, statx,
-    F_GETPIPE_SZ, F_GET_SEALS, F_SETPIPE_SZ,
+    __NR_mlock2, __NR_renameat2, __NR_statx, __NR_userfaultfd, statx, F_GETPIPE_SZ, F_GET_SEALS,
+    F_SETPIPE_SZ,
 };
-use std::convert::TryInto;
-use std::ffi::CStr;
-use std::io::{IoSlice, IoSliceMut, SeekFrom};
-use std::mem::MaybeUninit;
-use std::net::{SocketAddrV4, SocketAddrV6};
-use std::os::raw::{c_int, c_uint, c_void};
+#[cfg(feature = "vectored")]
+use linux_raw_sys::v5_4::general::{__NR_preadv2, __NR_pwritev2};
+#[cfg(feature = "vectored")]
+use std::io::{IoSlice, IoSliceMut};
 #[cfg(target_arch = "x86")]
 use {
     super::conv::x86_sys,
@@ -363,6 +371,7 @@ pub(crate) fn pread(fd: BorrowedFd<'_>, buf: &mut [u8], pos: u64) -> io::Result<
     }
 }
 
+#[cfg(feature = "vectored")]
 pub(crate) fn readv(fd: BorrowedFd<'_>, bufs: &[IoSliceMut]) -> io::Result<usize> {
     let (bufs_addr, bufs_len) = slice(bufs);
 
@@ -376,6 +385,7 @@ pub(crate) fn readv(fd: BorrowedFd<'_>, bufs: &[IoSliceMut]) -> io::Result<usize
     }
 }
 
+#[cfg(feature = "vectored")]
 pub(crate) fn preadv(fd: BorrowedFd<'_>, bufs: &[IoSliceMut], pos: u64) -> io::Result<usize> {
     let (bufs_addr, bufs_len) = slice(bufs);
 
@@ -402,6 +412,7 @@ pub(crate) fn preadv(fd: BorrowedFd<'_>, bufs: &[IoSliceMut], pos: u64) -> io::R
     }
 }
 
+#[cfg(feature = "vectored")]
 pub(crate) fn preadv2(
     fd: BorrowedFd<'_>,
     bufs: &[IoSliceMut],
@@ -489,6 +500,7 @@ pub(crate) fn pwrite(fd: BorrowedFd<'_>, buf: &[u8], pos: u64) -> io::Result<usi
     }
 }
 
+#[cfg(feature = "vectored")]
 #[inline]
 pub(crate) fn writev(fd: BorrowedFd<'_>, bufs: &[IoSlice]) -> io::Result<usize> {
     let (bufs_addr, bufs_len) = slice(bufs);
@@ -503,6 +515,7 @@ pub(crate) fn writev(fd: BorrowedFd<'_>, bufs: &[IoSlice]) -> io::Result<usize> 
     }
 }
 
+#[cfg(feature = "vectored")]
 #[inline]
 pub(crate) fn pwritev(fd: BorrowedFd<'_>, bufs: &[IoSlice], pos: u64) -> io::Result<usize> {
     let (bufs_addr, bufs_len) = slice(bufs);
@@ -530,6 +543,7 @@ pub(crate) fn pwritev(fd: BorrowedFd<'_>, bufs: &[IoSlice], pos: u64) -> io::Res
     }
 }
 
+#[cfg(feature = "vectored")]
 #[inline]
 pub(crate) fn pwritev2(
     fd: BorrowedFd<'_>,
@@ -1663,7 +1677,7 @@ pub(crate) fn accept_with(fd: BorrowedFd<'_>, flags: AcceptFlags) -> io::Result<
 pub(crate) fn acceptfrom(fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, SocketAddr)> {
     #[cfg(not(target_arch = "x86"))]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         let fd = ret_owned_fd(syscall3(
             nr(__NR_accept),
@@ -1678,7 +1692,7 @@ pub(crate) fn acceptfrom(fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, SocketAddr)
     }
     #[cfg(target_arch = "x86")]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         let fd = ret_owned_fd(syscall2(
             nr(__NR_socketcall),
@@ -1703,7 +1717,7 @@ pub(crate) fn acceptfrom_with(
 ) -> io::Result<(OwnedFd, SocketAddr)> {
     #[cfg(not(target_arch = "x86"))]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         let fd = ret_owned_fd(syscall4(
             nr(__NR_accept4),
@@ -1719,7 +1733,7 @@ pub(crate) fn acceptfrom_with(
     }
     #[cfg(target_arch = "x86")]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         let fd = ret_owned_fd(syscall2(
             nr(__NR_socketcall),
@@ -1982,7 +1996,7 @@ pub(crate) fn recvfrom(
 
     #[cfg(not(target_arch = "x86"))]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         let nread = ret_usize(syscall6(
             nr(__NR_recvfrom),
@@ -2000,7 +2014,7 @@ pub(crate) fn recvfrom(
     }
     #[cfg(target_arch = "x86")]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         let nread = ret_usize(syscall2(
             nr(__NR_socketcall),
@@ -2025,7 +2039,7 @@ pub(crate) fn recvfrom(
 pub(crate) fn getpeername(fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
     #[cfg(not(target_arch = "x86"))]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         ret(syscall3(
             nr(__NR_getpeername),
@@ -2040,7 +2054,7 @@ pub(crate) fn getpeername(fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
     }
     #[cfg(target_arch = "x86")]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         ret(syscall2(
             nr(__NR_socketcall),
@@ -2062,7 +2076,7 @@ pub(crate) fn getpeername(fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
 pub(crate) fn getsockname(fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
     #[cfg(not(target_arch = "x86"))]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         ret(syscall3(
             nr(__NR_getsockname),
@@ -2077,7 +2091,7 @@ pub(crate) fn getsockname(fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
     }
     #[cfg(target_arch = "x86")]
     unsafe {
-        let mut addrlen = std::mem::size_of::<sockaddr>() as socklen_t;
+        let mut addrlen = core::mem::size_of::<sockaddr>() as socklen_t;
         let mut storage = MaybeUninit::<sockaddr>::uninit();
         ret(syscall2(
             nr(__NR_socketcall),
@@ -3309,9 +3323,9 @@ pub(crate) mod sockopt {
     use crate::net::sockopt::Timeout;
     use crate::net::{Ipv4Addr, Ipv6Addr, SocketType};
     use io_lifetimes::BorrowedFd;
-    use std::convert::TryInto;
-    use std::os::raw::{c_int, c_uint};
-    use std::time::Duration;
+    use core::convert::TryInto;
+    use crate::c_types::{c_int, c_uint};
+    use core::time::Duration;
 
     #[inline]
     fn getsockopt<T>(fd: BorrowedFd<'_>, level: u32, optname: u32) -> io::Result<T> {
@@ -3319,7 +3333,7 @@ pub(crate) mod sockopt {
         #[cfg(not(target_arch = "x86"))]
         unsafe {
             let mut value = MaybeUninit::<T>::uninit();
-            let mut optlen = std::mem::size_of::<T>();
+            let mut optlen = core::mem::size_of::<T>();
             ret(syscall5(
                 nr(__NR_getsockopt),
                 borrowed_fd(fd),
@@ -3330,7 +3344,7 @@ pub(crate) mod sockopt {
             ))?;
             assert_eq!(
                 optlen as usize,
-                std::mem::size_of::<T>(),
+                core::mem::size_of::<T>(),
                 "unexpected getsockopt size"
             );
             Ok(value.assume_init())
@@ -3338,7 +3352,7 @@ pub(crate) mod sockopt {
         #[cfg(target_arch = "x86")]
         unsafe {
             let mut value = MaybeUninit::<T>::uninit();
-            let mut optlen = std::mem::size_of::<T>();
+            let mut optlen = core::mem::size_of::<T>();
             ret(syscall2(
                 nr(__NR_socketcall),
                 x86_sys(SYS_GETSOCKOPT),
@@ -3352,7 +3366,7 @@ pub(crate) mod sockopt {
             ))?;
             assert_eq!(
                 optlen as usize,
-                std::mem::size_of::<T>(),
+                core::mem::size_of::<T>(),
                 "unexpected getsockopt size"
             );
             Ok(value.assume_init())
@@ -3364,7 +3378,7 @@ pub(crate) mod sockopt {
         use super::*;
         #[cfg(not(target_arch = "x86"))]
         unsafe {
-            let optlen = std::mem::size_of::<T>().try_into().unwrap();
+            let optlen = core::mem::size_of::<T>().try_into().unwrap();
             ret(syscall5_readonly(
                 nr(__NR_setsockopt),
                 borrowed_fd(fd),
@@ -3376,7 +3390,7 @@ pub(crate) mod sockopt {
         }
         #[cfg(target_arch = "x86")]
         unsafe {
-            let optlen = std::mem::size_of::<T>().try_into().unwrap();
+            let optlen = core::mem::size_of::<T>().try_into().unwrap();
             ret(syscall2_readonly(
                 nr(__NR_socketcall),
                 x86_sys(SYS_SETSOCKOPT),
@@ -3491,7 +3505,7 @@ pub(crate) mod sockopt {
                     tv_sec: timeout
                         .as_secs()
                         .try_into()
-                        .unwrap_or(std::os::raw::c_long::MAX),
+                        .unwrap_or(crate::c_types::c_long::MAX),
                     tv_usec: timeout.subsec_micros() as _,
                 };
                 if timeout.tv_sec == 0 && timeout.tv_usec == 0 {
